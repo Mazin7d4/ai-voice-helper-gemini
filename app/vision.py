@@ -289,3 +289,136 @@ def describe_screen(screenshot_bytes: bytes, ui_elements_text: str = "") -> str:
     )
 
     return (resp.text or "").strip()
+
+
+# ── Browser-specific vision ────────────────────────────────────────────────
+
+BROWSER_SYSTEM_PROMPT = """\
+You are an AI that controls a web browser for a visually impaired user.
+You see a screenshot of a web page and a list of interactive elements.
+Decide ONE action toward the user's goal.
+
+## Browser Actions (return EXACTLY ONE as JSON)
+
+navigate: {"action": "navigate", "url": "https://example.com", "explanation": "..."}
+  Go to a specific URL. Use for direct navigation.
+
+click: {"action": "click", "target": "<visible text or label>", "explanation": "..."}
+  Click a link, button, input, or other element by its visible text.
+  The "target" MUST match text from the INTERACTIVE ELEMENTS list.
+
+type: {"action": "type", "text": "<string>", "field": "<field placeholder or label>", "explanation": "..."}
+  Type text into a field. "field" should match an input element's placeholder or label.
+
+press_key: {"action": "press_key", "key": "Enter|Tab|Escape|Backspace", "explanation": "..."}
+  Press a keyboard key.
+
+scroll: {"action": "scroll", "direction": "up|down", "amount": 3, "explanation": "..."}
+  Scroll the page.
+
+back: {"action": "back", "explanation": "..."}
+  Go back to previous page.
+
+search: {"action": "search", "query": "<search terms>", "explanation": "..."}
+  Search Google for something.
+
+wait: {"action": "wait", "ms": 1000, "explanation": "..."}
+  Wait for page to load.
+
+done: {"action": "done", "summary": "...", "explanation": "..."}
+  Goal is visually confirmed complete.
+
+## RULES
+1. Use element text from INTERACTIVE ELEMENTS for click targets — NEVER guess.
+   Match the EXACT text shown in the list.
+2. For URLs, use navigate with the full URL.
+3. To type in a field: click the field FIRST (by its placeholder text), then type in the NEXT step.
+4. NEVER return "done" unless the goal is visually confirmed complete.
+5. NEVER repeat the same failed action. Try a different approach.
+6. PREFER keyboard shortcuts when appropriate (Enter to submit, Tab to move).
+7. Be efficient — shortest path to the goal.
+
+Output ONLY valid JSON. No markdown, no extra text.
+"""
+
+
+def browser_decide_action(
+    goal: str,
+    screenshot_bytes: bytes,
+    page_info: dict,
+    interactive_elements: str = "",
+    last_action: dict | None = None,
+    last_error: str | None = None,
+    step: int = 1,
+    max_steps: int = 15,
+    action_history: list[dict] | None = None,
+) -> dict:
+    """
+    Analyze a browser screenshot and decide the next browser action.
+
+    Uses text-based selectors instead of pixel coordinates for reliability.
+    """
+    context_parts = [f"GOAL: {goal}"]
+    context_parts.append(f"Step {step}/{max_steps}.")
+
+    # Page info
+    if page_info:
+        title = page_info.get("title", "Unknown")
+        url = page_info.get("url", "")
+        context_parts.append(f"CURRENT PAGE: {title} ({url})")
+
+    # Interactive elements
+    if interactive_elements:
+        context_parts.append(f"\nINTERACTIVE ELEMENTS:\n{interactive_elements}")
+
+    # Action history
+    if action_history and len(action_history) > 1:
+        context_parts.append("\nPREVIOUS ACTIONS:")
+        recent = action_history[-5:]
+        for i, h in enumerate(recent):
+            ctx = f"  {i+1}. {h.get('action', '?')}"
+            if h.get("target"):
+                ctx += f' "{h["target"]}"'
+            elif h.get("url"):
+                ctx += f" → {h['url']}"
+            elif h.get("text"):
+                ctx += f' "{h["text"][:40]}"'
+            if h.get("explanation"):
+                ctx += f" — {h['explanation'][:60]}"
+            context_parts.append(ctx)
+
+    if last_error:
+        context_parts.append(f"\nLAST ERROR: {last_error}")
+
+    prompt = "\n".join(context_parts)
+
+    img_part = types.Part.from_bytes(data=screenshot_bytes, mime_type="image/jpeg")
+    text_part = types.Part.from_text(text=prompt)
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[img_part, text_part],
+        config=types.GenerateContentConfig(
+            system_instruction=BROWSER_SYSTEM_PROMPT,
+            temperature=0.05,
+        ),
+    )
+
+    raw = (response.text or "").strip()
+
+    # Clean markdown code blocks
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Try to find JSON in the response
+        m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group())
+            except json.JSONDecodeError:
+                pass
+        return {"action": "wait", "ms": 500, "explanation": "Could not parse vision response"}
+

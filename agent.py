@@ -32,10 +32,11 @@ from google import genai
 from google.genai import types
 
 from app.screen import capture_screen, get_screen_resolution, screenshot_to_native_coords
-from app.vision import decide_action, describe_screen
-from app.executor import execute_action, _APP_ALIASES
+from app.vision import decide_action, describe_screen, browser_decide_action
+from app.executor import execute_action, _APP_ALIASES, _lower_overlay
 from app.safety import needs_confirmation
 from app.ui_elements import get_ui_elements
+from app.browser import get_browser, resolve_url, extract_search_query, is_browser_goal
 
 # ── Config ──────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -606,10 +607,236 @@ def _extract_open_app(goal: str) -> str | None:
     return None
 
 
+# ── Browser action loop (Playwright) ────────────────────────────────────────
+
+def _handle_browser_goal(goal: str):
+    """Handle a browser task using Playwright — text-based selectors, no coordinates."""
+    stop_event.clear()
+    post_status("goal", goal)
+    post_status("status", "Working...")
+    narration_queue.put("On it.")
+
+    browser = get_browser()
+    _lower_overlay()  # let browser window appear above overlay
+
+    # ── Smart first action: detect URL or search query ──
+    url = resolve_url(goal)
+    search_query = extract_search_query(goal)
+
+    if not browser.is_active:
+        if url:
+            msg = browser.launch(url)
+        elif search_query:
+            msg = browser.launch(f"https://www.google.com/search?q={search_query}")
+        else:
+            msg = browser.launch("https://www.google.com")
+        post_status("action_log", f"browser: {msg}")
+        narration_queue.put(f"[System] {msg}")
+        time.sleep(1.5)  # wait for page to render
+    elif url:
+        msg = browser.navigate(url)
+        post_status("action_log", f"navigate: {msg}")
+        time.sleep(0.8)
+    elif search_query:
+        msg = browser.search_google(search_query)
+        post_status("action_log", f"search: {msg}")
+        time.sleep(0.8)
+
+    # Check if goal was just simple navigation (done already)
+    if _is_simple_browser_nav(goal) and (url or search_query):
+        page_info = browser.get_page_info()
+        narration_queue.put(
+            f"[System] Opened {page_info.get('title', 'the page')}."
+        )
+        post_status("status", "Done")
+        post_status("goal", "")
+        return
+
+    # ── Vision loop for complex browser tasks ──
+    last_action = None
+    last_error = None
+    action_history: list[dict] = []
+
+    for step in range(1, MAX_STEPS + 1):
+        if stop_event.is_set() or quit_event.is_set():
+            narration_queue.put("[System] Stopped.")
+            post_status("status", "Stopped")
+            return
+
+        # Check for new goal mid-task
+        try:
+            new_cmd = goal_queue.get_nowait()
+            if new_cmd[0] == "goal":
+                new_goal = new_cmd[1]
+                post_status("action_log", f"↪ Switching to: {new_goal}")
+                narration_queue.put("[System] Got it, switching to the new request.")
+                if is_browser_goal(new_goal, app_name_extractor=_extract_open_app):
+                    _handle_browser_goal(new_goal)
+                else:
+                    _handle_goal(new_goal)
+                return
+            elif new_cmd[0] == "describe":
+                _handle_describe()
+                continue
+        except queue.Empty:
+            pass
+
+        # 1) Take browser screenshot + get interactive elements
+        post_status("status", f"📸 Step {step}...")
+        time.sleep(0.3)  # let page settle
+
+        screenshot = browser.screenshot()
+        if not screenshot:
+            post_status("error", "Browser screenshot failed")
+            narration_queue.put("[System] I can't see the browser right now.")
+            return
+
+        page_info = browser.get_page_info()
+        interactive_els = browser.get_interactive_elements()
+
+        # 2) Ask vision model for next action
+        post_status("status", f"🧠 Step {step}...")
+        try:
+            action = browser_decide_action(
+                goal=goal,
+                screenshot_bytes=screenshot,
+                page_info=page_info,
+                interactive_elements=interactive_els,
+                last_action=last_action,
+                last_error=last_error,
+                step=step,
+                max_steps=MAX_STEPS,
+                action_history=action_history,
+            )
+        except Exception as e:
+            post_status("action_log", f"  Vision hiccup: {e}")
+            last_error = f"Vision failed: {e}"
+            time.sleep(0.5)
+            continue
+
+        act_type = action.get("action", "")
+        explanation = action.get("explanation", "")
+        post_status("action_log", f"{act_type}: {explanation}")
+
+        # Loop detection
+        if len(action_history) >= 3:
+            last_types = [a.get("action") for a in action_history[-3:]]
+            if all(t == act_type for t in last_types):
+                post_status("action_log", f"  Loop detected: {act_type} x4")
+                last_error = (
+                    f"LOOP: '{act_type}' attempted 4 times in a row. "
+                    f"Use a completely different approach."
+                )
+                action_history.append(action)
+                continue
+
+        action_history.append(action)
+
+        # 3) Done check
+        if act_type == "done":
+            narration_queue.put(f"[System] {action.get('summary', 'Done.')}")
+            post_status("status", "Done")
+            post_status("goal", "")
+            return
+
+        # 4) Execute the browser action
+        post_status("status", f"⚡ Step {step}...")
+        success = True
+        message = ""
+
+        if act_type == "navigate":
+            message = browser.navigate(action.get("url", ""))
+        elif act_type == "click":
+            message = browser.click_element(action.get("target", ""))
+            success = "Could not find" not in message
+        elif act_type == "type":
+            field = action.get("field")
+            message = browser.type_text(action.get("text", ""), field_hint=field)
+            success = "Could not" not in message
+        elif act_type == "press_key":
+            message = browser.press_key(action.get("key", "Enter"))
+        elif act_type == "scroll":
+            direction = action.get("direction", "down")
+            amount = int(action.get("amount", 3))
+            message = browser.scroll_page(direction, amount)
+        elif act_type == "back":
+            message = browser.go_back()
+        elif act_type == "search":
+            message = browser.search_google(action.get("query", ""))
+        elif act_type == "wait":
+            ms = int(action.get("ms", 1000))
+            time.sleep(ms / 1000)
+            message = f"Waited {ms}ms"
+        else:
+            message = f"Unknown browser action: {act_type}"
+            success = False
+
+        post_status("action_log", f"  {'✓' if success else '✗'} {message}")
+
+        if success:
+            last_action = action
+            last_error = None
+            narr = _short_browser_narration(action)
+            if narr:
+                narration_queue.put(f"[System] {narr}")
+        else:
+            last_action = action
+            last_error = message
+
+        time.sleep(0.5)  # let page settle
+
+    narration_queue.put(
+        f"[System] I've tried {MAX_STEPS} steps. Let me know if you need more help."
+    )
+    post_status("status", "Done")
+    post_status("goal", "")
+
+
+def _is_simple_browser_nav(goal: str) -> bool:
+    """Check if goal is just 'open X' or 'go to X' with no follow-up."""
+    lower = goal.lower().strip()
+    if " and " in lower or " then " in lower:
+        return False
+    # "open chatgpt", "go to youtube", "navigate to google.com"
+    if re.match(r"^(?:open|go to|navigate to|visit|launch)\s+", lower, re.IGNORECASE):
+        return True
+    # Bare website name like "chatgpt", "google"
+    from app.browser import _KNOWN_SITES, _BROWSER_NAMES
+    for name in _KNOWN_SITES:
+        if lower == name:
+            return True
+    for name in _BROWSER_NAMES:
+        if lower == name or lower == f"open {name}":
+            return True
+    return False
+
+
+def _short_browser_narration(action: dict) -> str | None:
+    """Short narration for browser actions. None to skip."""
+    act = action.get("action", "")
+    if act == "navigate":
+        return f"Opening {action.get('url', 'the page')}"
+    if act == "click":
+        return f"Clicking \"{action.get('target', '')}\""
+    if act == "type":
+        text = action.get("text", "")
+        return f"Typed: {text[:40]}" if text else None
+    if act == "search":
+        return f"Searching for \"{action.get('query', '')}\""
+    return None
+
+
 def _handle_goal(goal: str):
     """Run the screenshot → action → execute loop for a goal."""
     print(f"[ACTION] _handle_goal called with: '{goal}'")
     stop_event.clear()
+
+    # ── Route browser tasks to Playwright ──
+    if is_browser_goal(goal, app_name_extractor=_extract_open_app):
+        print(f"[ACTION] Routing to browser: '{goal}'")
+        _handle_browser_goal(goal)
+        return
+
     post_status("goal", goal)
     post_status("status", "Working...")
     narration_queue.put(f"On it.")
