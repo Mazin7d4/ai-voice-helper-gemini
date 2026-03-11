@@ -7,6 +7,7 @@ Send a screenshot + goal, get back exactly one action to execute.
 
 import os
 import json
+import re
 import time as _time
 from dotenv import load_dotenv
 from google import genai
