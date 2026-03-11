@@ -104,12 +104,28 @@ class BrowserController:
 
             self._browser = self._pw.chromium.launch(
                 headless=False,
-                args=["--start-maximized"],
+                args=[
+                    "--start-maximized",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-popup-blocking",
+                ],
             )
             self._context = self._browser.new_context(
                 viewport=None,
                 no_viewport=True,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
             )
+            # Remove webdriver detection flag
+            self._context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            """)
             self._page = self._context.new_page()
 
             if url:
@@ -228,9 +244,9 @@ class BrowserController:
         except Exception as e:
             return f"Go back failed: {e}"
 
-    def search_google(self, query: str) -> str:
-        """Navigate to Google search results."""
-        url = f"https://www.google.com/search?q={query}"
+    def search_web(self, query: str) -> str:
+        """Navigate to DuckDuckGo search results (avoids Google reCAPTCHA)."""
+        url = f"https://duckduckgo.com/?q={query}"
         if not self.is_active:
             return self.launch(url)
         try:
@@ -238,6 +254,9 @@ class BrowserController:
             return f"Searched for: {query}"
         except Exception as e:
             return f"Search failed: {e}"
+
+    # Backward compat alias
+    search_google = search_web
 
     def screenshot(self) -> bytes:
         """Take a JPEG screenshot of the current browser page."""
@@ -332,6 +351,127 @@ class BrowserController:
 
         except Exception:
             return ""
+
+    def detect_popup(self) -> dict | None:
+        """
+        Detect popups, dialogs, banners, overlays, CAPTCHAs on the page.
+
+        Returns a dict with 'description' and 'options' (button texts) if a
+        popup is found, or None if the page looks clean.
+
+        This is called BEFORE the vision model so we can force ask_user in
+        code — the model never gets a chance to auto-click.
+        """
+        if not self.is_active:
+            return None
+        try:
+            result = self._page.evaluate("""
+                () => {
+                    // ── 1. Check for modal/dialog overlays ──
+                    const modalSelectors = [
+                        '[role="dialog"]', '[role="alertdialog"]', '[aria-modal="true"]',
+                        'dialog[open]',
+                        // Common popup/modal CSS patterns
+                        '.modal', '.popup', '.overlay', '.dialog',
+                        '[class*="modal"]', '[class*="popup"]', '[class*="overlay"]',
+                        '[class*="dialog"]', '[class*="banner"]', '[class*="consent"]',
+                        '[class*="cookie"]', '[class*="notification"]',
+                        '[class*="promo"]', '[class*="interstitial"]',
+                        // Google-specific
+                        '[class*="captcha"]', '[class*="recaptcha"]', '#captcha',
+                        'iframe[src*="recaptcha"]',
+                        // Common overlay/backdrop patterns
+                        '[class*="backdrop"]', '[class*="lightbox"]',
+                    ];
+
+                    for (const sel of modalSelectors) {
+                        const els = document.querySelectorAll(sel);
+                        for (const el of els) {
+                            const rect = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            if (style.display === 'none' || style.visibility === 'hidden') continue;
+                            if (rect.width < 50 || rect.height < 50) continue;
+
+                            // Get popup text
+                            let text = el.innerText?.trim().substring(0, 300) || '';
+
+                            // Get buttons inside the popup
+                            const btns = el.querySelectorAll(
+                                'button, [role="button"], a[href], input[type="submit"], input[type="button"]'
+                            );
+                            const options = [];
+                            for (const btn of btns) {
+                                const btnText = (
+                                    btn.innerText?.trim() ||
+                                    btn.value?.trim() ||
+                                    btn.getAttribute('aria-label') ||
+                                    ''
+                                ).substring(0, 60);
+                                if (btnText && btnText.length > 0) {
+                                    options.push(btnText);
+                                }
+                            }
+
+                            if (text.length > 10 || options.length > 0) {
+                                return {
+                                    description: text.substring(0, 200),
+                                    options: options.slice(0, 6),
+                                    type: sel
+                                };
+                            }
+                        }
+                    }
+
+                    // ── 2. Check for reCAPTCHA iframe ──
+                    const captchaFrames = document.querySelectorAll(
+                        'iframe[src*="recaptcha"], iframe[src*="captcha"], iframe[title*="captcha"], iframe[title*="reCAPTCHA"]'
+                    );
+                    for (const f of captchaFrames) {
+                        const rect = f.getBoundingClientRect();
+                        if (rect.width > 30 && rect.height > 30) {
+                            return {
+                                description: 'A CAPTCHA verification challenge is showing. This website thinks we might be a bot.',
+                                options: ['Try a different website', 'Wait and retry', 'Skip this'],
+                                type: 'captcha'
+                            };
+                        }
+                    }
+
+                    // ── 3. Check for large fixed/sticky overlays ──
+                    const fixedEls = document.querySelectorAll('*');
+                    for (const el of fixedEls) {
+                        const style = window.getComputedStyle(el);
+                        if (style.position !== 'fixed' && style.position !== 'sticky') continue;
+                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+                        const rect = el.getBoundingClientRect();
+                        // Large fixed overlay covering significant portion of viewport
+                        if (rect.width > window.innerWidth * 0.3 &&
+                            rect.height > window.innerHeight * 0.3 &&
+                            el.tagName !== 'HTML' && el.tagName !== 'BODY' &&
+                            !el.matches('header, nav, footer')) {
+                            let text = el.innerText?.trim().substring(0, 300) || '';
+                            const btns = el.querySelectorAll('button, [role="button"], a');
+                            const options = [];
+                            for (const btn of btns) {
+                                const t = (btn.innerText?.trim() || '').substring(0, 60);
+                                if (t) options.push(t);
+                            }
+                            if (options.length > 0 || text.length > 20) {
+                                return {
+                                    description: text.substring(0, 200),
+                                    options: options.slice(0, 6),
+                                    type: 'fixed-overlay'
+                                };
+                            }
+                        }
+                    }
+
+                    return null;
+                }
+            """)
+            return result
+        except Exception:
+            return None
 
     def close(self):
         """Close the browser and clean up resources."""
@@ -436,21 +576,28 @@ def is_browser_goal(goal: str, app_name_extractor=None) -> bool:
             return True
 
     # If Playwright browser is already active, DEFAULT to browser for all goals
-    # UNLESS the goal is clearly about an OS-level app
+    # UNLESS the goal is clearly about a known OS-level app
     browser = get_browser()
     if browser.is_active:
-        # Opening a known OS app → use OS executor
-        if app_name_extractor and app_name_extractor(goal):
-            return False
-        # Explicitly about OS-level actions → skip browser
-        if re.search(
-            r"\b(notepad|excel|word|powerpoint|explorer|file manager|settings|terminal|"
-            r"cmd|powershell|task manager|control panel|calculator|paint|snipping)",
-            lower,
-        ):
-            return False
-        # Everything else goes to browser when it's active
-        # (close popup, press button, search, type, scroll, read, etc.)
+        # Only break out of browser for KNOWN OS apps
+        if app_name_extractor:
+            app = app_name_extractor(goal)
+            # Only route to OS if it's a known app AND not a browser name
+            if app and app in _OS_ONLY_APPS:
+                return False
+        # Everything else stays in browser when it's active:
+        # "click images tab", "close popup", "scroll down", etc.
         return True
 
     return False
+
+
+# Apps that should ALWAYS use OS executor even when browser is active
+_OS_ONLY_APPS = {
+    "notepad", "calculator", "calc", "paint", "wordpad",
+    "cmd", "command prompt", "terminal", "windows terminal", "powershell",
+    "file explorer", "explorer", "task manager", "settings", "control panel",
+    "snipping tool", "excel", "microsoft excel", "word", "microsoft word",
+    "powerpoint", "outlook", "teams", "spotify", "discord", "slack",
+    "vscode", "visual studio code", "vs code", "notepad++",
+}

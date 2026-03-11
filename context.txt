@@ -1,20 +1,191 @@
-Progress Update — March 10, 2026
-===================================
+Context for Next Coding Agent — March 10, 2026
+=================================================
 
-Our work is going well — we have good progress.
+## PROJECT OVERVIEW
+AI Voice Helper for visually impaired users. Real-time voice → screen control.
+- Voice input via Gemini Live API (function calling for routing)
+- Vision via Gemini 2.5 Flash (Vertex AI) — screenshot → action JSON
+- OS control via pyautogui (mouse/keyboard)
+- Browser control via Playwright Chromium (DOM selectors)
+- GUI: tkinter overlay (always-on-top, dark theme)
+- 3 threads: Main (tkinter), Voice (asyncio), Action (vision+execution)
 
-The main remaining issue is click accuracy. The system got stuck because it
-couldn't click on folders correctly in some cases.
+## ARCHITECTURE: HYBRID BROWSER + OS
+We added Playwright for browser tasks because pyautogui (screenshot → pixel
+coordinate guessing) was terrible for web interaction. The system now has:
 
-Example: When asked to save a Notepad document to the Desktop, the vision
-model navigated to the C: drive instead, because "Desktop" wasn't visible
-in the Quick Access sidebar at that moment. We got stuck due to click
-inaccuracy on the folder tree.
+  Browser tasks (websites, search, web apps) → Playwright (DOM selectors)
+  OS tasks (notepad, file manager, etc.)     → pyautogui (coordinates)
 
-However, most clicks and core functions are much better than before:
-- When asked to save to the Downloads folder, it DID correctly click on
-  Downloads from the Quick Access sidebar.
-- It then couldn't accurately click the Save button — minor improvement needed.
+Detection: app/browser.py `is_browser_goal()` decides routing.
+When Playwright browser is ACTIVE, ALL goals default to browser UNLESS
+the goal explicitly mentions an OS app (notepad, excel, settings, etc.).
+When browser is INACTIVE, only website/URL/search goals go to browser.
 
-Overall the system is functional and improving. Click precision and task
-logic need minor refinement, which we can address later.
+## CHANGES MADE THIS SESSION
+
+### 1. Overlay Focus Stealing (FIXED)
+PROBLEM: Apps opened behind the overlay because of `-topmost True`.
+After `subprocess.Popen("msedge")`, Edge opened but was invisible.
+FIX:
+- gui/overlay.py: Added `-toolwindow True` attribute
+- gui/overlay.py: Removed `root.lift()` from restore handler
+- app/executor.py: Added `_lower_overlay()` / `_raise_overlay()` using
+  SetWindowPos to toggle topmost. Called before ALL interactive actions
+  (click, type, open_app, hotkey, scroll) so pyautogui hits the app,
+  not the overlay sitting on top.
+
+### 2. Post-Launch Window Activation (FIXED)
+PROBLEM: `_open_app()` did `subprocess.Popen(exe)` + `sleep(1.5)` but
+never found/activated the new window. Window appeared behind overlay.
+FIX:
+- app/executor.py: Added `_activate_window_by_title()` — finds visible
+  windows by title substring, uses Alt-key trick + SetForegroundWindow.
+- Added `_APP_WINDOW_TITLES` dict mapping exe names to window title
+  patterns (Edge→"Edge", Chrome→"Chrome", etc.)
+- After Popen, polls up to 4 seconds (8×500ms) for window to appear
+  and force-activates it.
+
+### 3. UI Elements Always Gathered (FIXED)
+PROBLEM: UI elements (Windows UI Automation with exact coordinates) were
+only gathered on step>1 and after click/type/scroll. Skipped on step 1
+and after open_app/hotkey. This meant first clicks had no coordinate data.
+FIX:
+- agent.py: Removed all conditional skipping. UI elements gathered on
+  EVERY step. ~400ms cost is worth it for click accuracy.
+
+### 4. Playwright Browser Integration (NEW)
+PROBLEM: pyautogui was terrible for browsers. Couldn't click shortcuts
+(too small), clicked wrong search results, couldn't focus input fields.
+Example: "open chatgpt in Firefox" → clicked search bar → clicked Bing
+result → loop detected → gave up. 15+ failed click attempts.
+FIX:
+- app/browser.py: Full rewrite. `BrowserController` class with Playwright.
+  Methods: launch(), navigate(), click_element(), type_text(), press_key(),
+  scroll_page(), search_google(), get_interactive_elements()
+- click_element() uses 9 strategies: link, button, placeholder, label,
+  textbox, tab, menuitem, heading, text — by visible text, not coordinates.
+- get_interactive_elements() extracts DOM elements (links, buttons, inputs)
+  with their text/role for the vision model.
+- Known sites map: chatgpt→chatgpt.com, google, youtube, etc. (25+ sites)
+- is_browser_goal() detects browser vs OS tasks.
+- app/vision.py: Added `browser_decide_action()` with browser-specific
+  prompt. Outputs text-based actions (click by "target" text, not x/y).
+- agent.py: `_handle_goal()` routes to `_handle_browser_goal()` for web.
+
+### 5. Missing `re` Import (FIXED)
+PROBLEM: `browser_decide_action()` in vision.py used `re.sub()` and
+`re.search()` but `re` was not imported. Every browser vision step crashed
+with `name 're' is not defined`. This made the browser completely non-functional
+— it opened pages but could never execute any follow-up action.
+FIX: Added `import re` to app/vision.py.
+
+### 6. Browser Routing When Active (FIXED)
+PROBLEM: When browser was active and user said "close the popup" or
+"press not interested", the router only checked for verbs like
+click|type|scroll — missed close|press|dismiss. Goals went to pyautogui
+instead of Playwright.
+FIX:
+- app/browser.py: Changed `is_browser_goal()` — when browser is ACTIVE,
+  ALL goals default to browser UNLESS explicitly about an OS app.
+  No more verb-matching gaps.
+- agent.py: `_handle_describe()` now uses browser screenshot + interactive
+  elements when browser is active (instead of OS screenshot only).
+
+### 7. Voice Prompt: Chromium Naming (FIXED)
+PROBLEM: When user said "open Firefox", voice model said "I've opened
+Firefox" but it's actually Playwright's Chromium.
+FIX: Voice prompt now says "Opening the browser for you" — never names
+the specific browser brand.
+
+### 8. Auto-Clicking Popups (FIXED — CODE-LEVEL ENFORCEMENT)
+PROBLEM: Vision model sees a "Choose Chrome — Try it" popup and auto-clicks
+"Try it" without asking the user. A blind user must ALWAYS be in control.
+This happened TWICE despite adding prompt rules against it.
+
+ROOT CAUSE: The vision model interprets popup buttons as goal-fulfilling
+actions. Prompt rules alone cannot override the model's goal-seeking behavior.
+
+FIX (multi-layered defense):
+a) CODE-LEVEL POPUP DETECTION (browser.py):
+   - Added `detect_popup()` method to BrowserController
+   - Scans DOM for modal dialogs, overlays, cookie banners, CAPTCHAs,
+     fixed overlays, reCAPTCHA iframes using comprehensive CSS selectors
+   - Returns popup description + button options text, or None if clean
+   - This runs BEFORE the vision model ever sees the screenshot
+
+b) PRE-VISION POPUP GUARD (agent.py):
+   - `_handle_popup_for_user()` function — called BEFORE browser_decide_action
+   - If popup detected: narrates popup content to user, lists button options,
+     waits up to 60s for user to choose
+   - The vision model NEVER gets a chance to auto-click popups
+   - Also runs AFTER every browser action (post-action guard)
+   - Also runs after initial browser launch/navigate
+
+c) HARDENED VISION PROMPT (vision.py):
+   - Safety rule moved to TOP of prompt (before action definitions)
+   - Explicit blocklist of promotional button texts (Try, Accept, Allow, etc.)
+   - click action description now says "NEVER use for popups"
+   - ask_user marked as "MANDATORY" for all overlay elements
+   - This is the backup defense — code-level detection is primary
+
+### 9. reCAPTCHA Bot Detection (FIXED)
+PROBLEM: Google triggers CAPTCHA when Playwright navigates to google.com
+(detected as bot). Blocks blind users completely.
+FIX:
+a) Stealth Playwright launch args (browser.py):
+   - --disable-blink-features=AutomationControlled
+   - --no-first-run, --no-default-browser-check, --disable-infobars
+   - Custom user agent string (real Chrome UA)
+   - navigator.webdriver property removed via init script
+b) Switched default search engine to DuckDuckGo:
+   - agent.py: Default browser page → duckduckgo.com (was google.com)
+   - agent.py: Search queries → duckduckgo.com/?q= (was google.com/search?q=)
+   - browser.py: search_google() now uses DuckDuckGo URL
+   - DuckDuckGo doesn't trigger reCAPTCHA for Playwright browsers
+c) Popup detection catches reCAPTCHA iframes and describes to user
+
+## KNOWN REMAINING ISSUES
+
+1. **Click accuracy for OS apps** — Save As dialogs still have issues.
+   When told to save to Desktop, navigated to C: drive instead.
+   Clicks on small folder tree items miss. UI elements help but aren't
+   perfect for complex nested UIs.
+
+2. **Playwright launches Chromium, not user's browser** — When user says
+   "open Firefox" or "open Edge", Playwright opens its own Chromium.
+   User may be confused. Currently mitigated by voice prompt but not ideal.
+
+## FILE INVENTORY
+
+- agent.py (~1157 lines): Main orchestrator. Voice thread, action thread,
+  browser routing, function calling, goal handling.
+- app/browser.py (~452 lines): Playwright BrowserController, is_browser_goal(),
+  resolve_url(), known sites map.
+- app/vision.py (~426 lines): Gemini vision. OS prompt (coordinate-based) +
+  browser prompt (text-based). describe_screen(), decide_action(),
+  browser_decide_action().
+- app/executor.py (~382 lines): pyautogui actions. _open_app(), click, type,
+  hotkey, scroll. Overlay z-order management.
+- app/screen.py (~96 lines): mss screenshot. Overlay alpha hide/show.
+- app/ui_elements.py (~186 lines): Windows UI Automation element extraction.
+- app/safety.py: Safety checks for risky actions.
+- gui/overlay.py (~439 lines): tkinter GUI. -topmost, -toolwindow.
+- run.py: Entry point.
+- voice_live.py: Standalone voice test (not used in production).
+
+## ENVIRONMENT
+- Python 3.14.2 venv at .venv/
+- Vertex AI: project='sighted-it-helper-personal', location='us-central1'
+  Service account key: C:\Dev\keys\sighted-it-helper-personal-d43c1ecefaeb.json
+- API Key: GEMINI_API_KEY in .env (for Live API voice)
+- Vision model: gemini-2.5-flash (Vertex AI)
+- Voice model: gemini-2.5-flash-native-audio-preview-12-2025 (API key, Live API)
+- Playwright Chromium 145 installed
+- GitHub: https://github.com/Mazin7d4/ai-voice-helper-gemini.git
+
+## HOW TO RUN
+```
+$env:GOOGLE_APPLICATION_CREDENTIALS = "C:\Dev\keys\sighted-it-helper-personal-d43c1ecefaeb.json"
+.venv\Scripts\python.exe run.py
+```

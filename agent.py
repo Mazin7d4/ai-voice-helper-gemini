@@ -38,6 +38,100 @@ from app.safety import needs_confirmation
 from app.ui_elements import get_ui_elements
 from app.browser import get_browser, resolve_url, extract_search_query, is_browser_goal
 
+
+def _handle_popup_for_user(browser, goal: str) -> bool:
+    """
+    Check if there's a popup/dialog/CAPTCHA on the page.
+    If found, narrate it to the user and wait for their decision.
+
+    Returns True if a popup was handled (caller should skip vision model),
+    False if no popup detected (caller should proceed normally).
+    """
+    popup = browser.detect_popup()
+    if not popup:
+        return False
+
+    desc = popup.get("description", "Something appeared on screen.")
+    options = popup.get("options", [])
+    popup_type = popup.get("type", "")
+
+    # Build a clear narration for the blind user
+    if "captcha" in popup_type.lower():
+        narration_queue.put(
+            "[System] There's a CAPTCHA verification challenge on this page. "
+            "The website thinks we might be a bot. "
+            "Would you like me to try a different website, wait and retry, or skip this?"
+        )
+    elif options:
+        opts_text = ", ".join(f"'{o}'" for o in options[:6])
+        # Summarize what the popup says
+        short_desc = desc[:150].replace("\n", " ").strip()
+        if short_desc:
+            narration_queue.put(
+                f"[System] A popup appeared: {short_desc}. "
+                f"The buttons are: {opts_text}. "
+                f"What would you like me to do?"
+            )
+        else:
+            narration_queue.put(
+                f"[System] A popup appeared with these options: {opts_text}. "
+                f"What would you like me to do?"
+            )
+    else:
+        narration_queue.put(
+            f"[System] Something appeared on the page: {desc[:150]}. "
+            f"What would you like me to do?"
+        )
+
+    post_status("status", "Waiting for your choice...")
+    post_status("action_log", f"popup: {desc[:100]} — asking user")
+
+    # Wait for user response
+    for _ in range(600):  # 60 seconds
+        if stop_event.is_set() or quit_event.is_set():
+            return True
+        try:
+            new_cmd = goal_queue.get(timeout=0.1)
+            if new_cmd[0] == "goal":
+                user_choice = new_cmd[1]
+                post_status("action_log", f"↪ User chose: {user_choice}")
+                narration_queue.put("[System] Got it.")
+
+                # Try to match user's choice to a popup button
+                lower_choice = user_choice.lower().strip()
+                for opt in options:
+                    if opt.lower() in lower_choice or lower_choice in opt.lower():
+                        try:
+                            msg = browser.click_element(opt)
+                            post_status("action_log", f"  ✓ {msg}")
+                            narration_queue.put(f"[System] I clicked '{opt}' for you.")
+                        except Exception as e:
+                            post_status("action_log", f"  ✗ Click failed: {e}")
+                        return True
+
+                # If no exact match, treat user's text as a click target
+                if any(word in lower_choice for word in ["click", "press", "select", "choose", "yes", "ok"]):
+                    # Extract what to click from user's response
+                    for opt in options:
+                        try:
+                            msg = browser.click_element(opt)
+                            if "Could not" not in msg:
+                                post_status("action_log", f"  ✓ {msg}")
+                                narration_queue.put(f"[System] Done.")
+                                return True
+                        except Exception:
+                            continue
+
+                # User gave a different instruction — push it back as new goal
+                goal_queue.put(new_cmd)
+                return True
+            elif new_cmd[0] == "describe":
+                _handle_describe()
+        except queue.Empty:
+            continue
+
+    return True
+
 # ── Config ──────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
@@ -617,7 +711,11 @@ def _handle_describe():
 
 def _extract_open_app(goal: str) -> str | None:
     """If the goal is clearly 'open <app>' or just an app name, return the app name.
-    Returns None if it's not a simple app-open command."""
+    Returns None if it's not a simple app-open command.
+    
+    ONLY matches known app names from _APP_ALIASES. Does NOT match arbitrary
+    phrases like 'open the images tab' — those should stay in the current
+    execution context (browser or OS vision loop)."""
     text = goal.strip()
     # Case 1: bare app name like "notepad", "chrome"
     if _APP_NAME_PATTERN.match(text):
@@ -626,8 +724,8 @@ def _extract_open_app(goal: str) -> str | None:
     m = _OPEN_CMD_PATTERN.match(text)
     if m:
         app_name = m.group(1).strip().lower()
-        # Verify it's a known app or a reasonable name (not a complex sentence)
-        if app_name in _APP_NAMES_SET or len(app_name.split()) <= 3:
+        # ONLY match known apps — never match arbitrary phrases
+        if app_name in _APP_NAMES_SET:
             return app_name
     return None
 
@@ -652,9 +750,9 @@ def _handle_browser_goal(goal: str):
         if url:
             msg = browser.launch(url)
         elif search_query:
-            msg = browser.launch(f"https://www.google.com/search?q={search_query}")
+            msg = browser.launch(f"https://duckduckgo.com/?q={search_query}")
         else:
-            msg = browser.launch("https://www.google.com")
+            msg = browser.launch("https://duckduckgo.com")
         post_status("action_log", f"browser: {msg}")
         narration_queue.put(f"[System] {msg}")
         time.sleep(1.5)  # wait for page to render
@@ -663,12 +761,14 @@ def _handle_browser_goal(goal: str):
         post_status("action_log", f"navigate: {msg}")
         time.sleep(0.8)
     elif search_query:
-        msg = browser.search_google(search_query)
+        msg = browser.search_web(search_query)
         post_status("action_log", f"search: {msg}")
         time.sleep(0.8)
 
     # Check if goal was just simple navigation (done already)
     if _is_simple_browser_nav(goal) and (url or search_query):
+        # ── POPUP GUARD after initial navigation ──
+        _handle_popup_for_user(browser, goal)
         page_info = browser.get_page_info()
         narration_queue.put(
             f"[System] Opened {page_info.get('title', 'the page')}."
@@ -710,6 +810,13 @@ def _handle_browser_goal(goal: str):
         post_status("status", f"📸 Step {step}...")
         time.sleep(0.3)  # let page settle
 
+        # ── POPUP GUARD: check for popups BEFORE vision model ──
+        # This is the critical safety check — the vision model never gets
+        # a chance to auto-click popup buttons because we intercept here.
+        if _handle_popup_for_user(browser, goal):
+            time.sleep(0.5)
+            continue  # re-screenshot after user dealt with popup
+
         screenshot = browser.screenshot()
         if not screenshot:
             post_status("error", "Browser screenshot failed")
@@ -743,17 +850,29 @@ def _handle_browser_goal(goal: str):
         explanation = action.get("explanation", "")
         post_status("action_log", f"{act_type}: {explanation}")
 
-        # Loop detection
+        # Loop detection — take corrective action in code, don't just warn
         if len(action_history) >= 3:
-            last_types = [a.get("action") for a in action_history[-3:]]
+            last_actions = action_history[-3:]
+            last_types = [a.get("action") for a in last_actions]
             if all(t == act_type for t in last_types):
-                post_status("action_log", f"  Loop detected: {act_type} x4")
-                last_error = (
-                    f"LOOP: '{act_type}' attempted 4 times in a row. "
-                    f"Use a completely different approach."
-                )
-                action_history.append(action)
-                continue
+                corrective = _browser_loop_corrective(act_type, last_actions, browser)
+                if corrective:
+                    post_status("action_log", f"  Loop detected: {act_type} x4 → trying {corrective['action']}")
+                    action_history.append(corrective)
+                    # Execute the corrective action directly
+                    _execute_browser_corrective(corrective, browser)
+                    last_action = corrective
+                    last_error = None
+                    time.sleep(0.5)
+                    continue
+                else:
+                    post_status("action_log", f"  Loop detected: {act_type} x4")
+                    last_error = (
+                        f"LOOP: '{act_type}' attempted 4 times in a row. "
+                        f"Use a COMPLETELY different action type."
+                    )
+                    action_history.append(action)
+                    continue
 
         action_history.append(action)
 
@@ -787,7 +906,7 @@ def _handle_browser_goal(goal: str):
         elif act_type == "back":
             message = browser.go_back()
         elif act_type == "search":
-            message = browser.search_google(action.get("query", ""))
+            message = browser.search_web(action.get("query", ""))
         elif act_type == "wait":
             ms = int(action.get("ms", 1000))
             time.sleep(ms / 1000)
@@ -841,6 +960,13 @@ def _handle_browser_goal(goal: str):
 
         time.sleep(0.5)  # let page settle
 
+        # ── POST-ACTION POPUP GUARD: check if action triggered a popup ──
+        if success and act_type not in ("done", "ask_user", "wait"):
+            if _handle_popup_for_user(browser, goal):
+                time.sleep(0.5)
+                # After popup, re-check if goal is done
+                continue
+
     narration_queue.put(
         f"[System] I've tried {MAX_STEPS} steps. Let me know if you need more help."
     )
@@ -880,6 +1006,68 @@ def _short_browser_narration(action: dict) -> str | None:
     if act == "search":
         return f"Searching for \"{action.get('query', '')}\""
     return None
+
+
+def _browser_loop_corrective(act_type: str, last_actions: list[dict], browser) -> dict | None:
+    """
+    When the same browser action is repeated 3+ times with no progress,
+    generate a corrective action to break the loop.
+
+    Returns a corrective action dict, or None if no smart fix available.
+    """
+    if act_type == "click":
+        # Clicking repeatedly (e.g., Search button) with no result?
+        # → Try pressing Enter instead — most search forms submit with Enter
+        last_targets = [a.get("target", "") for a in last_actions]
+        is_search_click = any(
+            "search" in t.lower() or "submit" in t.lower() or "go" in t.lower()
+            for t in last_targets
+        )
+        if is_search_click:
+            return {
+                "action": "press_key",
+                "key": "Enter",
+                "explanation": "Loop fix: pressing Enter instead of clicking Search button",
+            }
+        # Generic click loop → try Escape (maybe a popup is blocking)
+        return {
+            "action": "press_key",
+            "key": "Escape",
+            "explanation": "Loop fix: pressing Escape to dismiss any blocking element",
+        }
+
+    if act_type == "type":
+        # Typing repeatedly → click the field first, then content will be re-typed
+        # by the vision model on the next step
+        return {
+            "action": "press_key",
+            "key": "Tab",
+            "explanation": "Loop fix: Tab to move focus, will retry typing next step",
+        }
+
+    if act_type == "navigate":
+        # Navigation loop → page might not be loading
+        return {
+            "action": "wait",
+            "ms": 2000,
+            "explanation": "Loop fix: waiting for page to load",
+        }
+
+    return None  # no smart fix for this action type
+
+
+def _execute_browser_corrective(action: dict, browser) -> None:
+    """Execute a corrective action on the browser."""
+    act = action.get("action", "")
+    try:
+        if act == "press_key":
+            browser.press_key(action.get("key", "Enter"))
+        elif act == "wait":
+            time.sleep(action.get("ms", 1000) / 1000)
+        elif act == "scroll":
+            browser.scroll_page(action.get("direction", "down"), action.get("amount", 3))
+    except Exception:
+        pass
 
 
 def _handle_goal(goal: str):
