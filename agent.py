@@ -184,6 +184,10 @@ async def voice_session():
                     "When the user asks to use a browser or open a website, a Chromium browser will open. "
                     "If they say 'open Firefox' or 'open Chrome', say 'Opening the browser for you' — "
                     "do NOT say 'Opening Firefox' or 'Opening Chrome' since it's actually Chromium. "
+                    "\nPOPUPS AND DIALOGS: When you see a popup, dialog, notification, cookie banner, "
+                    "or ANY unexpected choice on screen, NEVER click it yourself. ALWAYS describe it "
+                    "to the user and ask what they want to do. Example: 'There's a popup asking if you "
+                    "want to try Chrome — should I click Not Interested or Try It?' Let the USER decide. "
                     "\n\nCRITICAL: Use the execute_task tool for ANY computer command the user gives. "
                     "If user says just an app name like 'notepad' or 'chrome', call execute_task with 'open notepad' or 'open chrome'. "
                     "Use describe_screen when user asks what's on screen, OR when you need to check screen state yourself. "
@@ -788,6 +792,37 @@ def _handle_browser_goal(goal: str):
             ms = int(action.get("ms", 1000))
             time.sleep(ms / 1000)
             message = f"Waited {ms}ms"
+        elif act_type == "ask_user":
+            # Pause and ask the user what to do
+            question = action.get("question", "What would you like me to do?")
+            options = action.get("options", [])
+            if options:
+                opts_text = ", ".join(f"'{o}'" for o in options)
+                narration_queue.put(
+                    f"[System] {question} Your options are: {opts_text}. "
+                    f"Tell me which one you'd like."
+                )
+            else:
+                narration_queue.put(f"[System] {question}")
+            post_status("status", "Waiting for your choice...")
+            # Wait for the user to give a new goal with their choice
+            for _ in range(600):  # 60 seconds
+                if stop_event.is_set() or quit_event.is_set():
+                    break
+                try:
+                    new_cmd = goal_queue.get(timeout=0.1)
+                    if new_cmd[0] == "goal":
+                        # User responded — use it as the new goal in this browser session
+                        goal = new_cmd[1]
+                        post_status("goal", goal)
+                        post_status("action_log", f"↪ User chose: {goal}")
+                        narration_queue.put("[System] Got it.")
+                        break
+                    elif new_cmd[0] == "describe":
+                        _handle_describe()
+                except queue.Empty:
+                    continue
+            message = f"Asked user: {question}"
         else:
             message = f"Unknown browser action: {act_type}"
             success = False

@@ -329,15 +329,23 @@ wait: {"action": "wait", "ms": 1000, "explanation": "..."}
 done: {"action": "done", "summary": "...", "explanation": "..."}
   Goal is visually confirmed complete.
 
+ask_user: {"action": "ask_user", "question": "<describe what needs user decision>", "options": ["option1", "option2"], "explanation": "..."}
+  Ask the user to make a decision. Use this for ANY unexpected popup, dialog,
+  cookie banner, notification, permission prompt, or choice that wasn't
+  part of the original goal.
+
 ## RULES
-1. Use element text from INTERACTIVE ELEMENTS for click targets — NEVER guess.
+1. Use element text from INTERACTIVE ELEMENTS for click targets \u2014 NEVER guess.
    Match the EXACT text shown in the list.
 2. For URLs, use navigate with the full URL.
 3. To type in a field: click the field FIRST (by its placeholder text), then type in the NEXT step.
 4. NEVER return "done" unless the goal is visually confirmed complete.
 5. NEVER repeat the same failed action. Try a different approach.
 6. PREFER keyboard shortcuts when appropriate (Enter to submit, Tab to move).
-7. Be efficient — shortest path to the goal.
+7. Be efficient \u2014 shortest path to the goal.
+8. POPUPS/DIALOGS: If you see a popup, notification, cookie banner, CAPTCHA,
+   or any dialog that is NOT directly part of the goal, use ask_user to let
+   the user decide. NEVER click popup buttons on your own.
 
 Output ONLY valid JSON. No markdown, no extra text.
 """
