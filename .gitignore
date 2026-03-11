@@ -39,6 +39,7 @@ Thumbs.db
 *.log
 
 # Environment variables
+.env
 .env.local
 
 # Playwright browsers (if not using system install)

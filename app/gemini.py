@@ -66,7 +66,7 @@ Decide the next ONE action based on the screenshot.
         ),
     )
 
-    text = resp.text.strip()
+    text = (resp.text or "").strip()
 
     # Hard guard: extract JSON even if wrapped
     start = text.find("{")

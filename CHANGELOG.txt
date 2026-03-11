@@ -1,0 +1,325 @@
+AI Voice Helper — App Summary & Changelog
+==========================================
+
+## What It Is
+A real-time AI voice assistant for visually impaired users that can see and control
+ANY Windows application. The user speaks naturally, and the AI sees the screen,
+decides what to do, and executes mouse/keyboard actions — while talking back
+conversationally.
+
+## Architecture (3 threads)
+
+| Thread   | Purpose                                    | Tech                          |
+|----------|--------------------------------------------|-------------------------------|
+| Main     | Tkinter GUI event loop                     | tkinter                       |
+| Voice    | Real-time bidirectional audio via Live API  | google-genai + sounddevice    |
+| Action   | Screenshot → Vision AI → OS execution loop | mss + google-genai + pyautogui|
+
+## File Structure
+
+| File              | Role                                                          |
+|-------------------|---------------------------------------------------------------|
+| run.py            | Entry point — launches gui.overlay.main()                     |
+| agent.py          | Orchestrator — voice thread, action thread, speech routing     |
+| app/screen.py     | Screen capture (mss, JPEG, 1536px)                            |
+| app/vision.py     | Screenshot → action JSON via Gemini 2.5 Flash                 |
+| app/executor.py   | Translates action JSON into pyautogui mouse/keyboard events   |
+| app/ui_elements.py| Windows UI Automation — exact element coords for click targets |
+| app/safety.py     | Flags risky actions (buy, delete, etc.) for confirmation       |
+| gui/overlay.py    | Full tkinter window — action log, mic status, controls         |
+| voice_live.py     | Standalone voice test (independent of main app)                |
+| app/browser.py    | Legacy browser-only module (kept for reference)                |
+| app/gemini.py     | Legacy browser vision module (kept for reference)              |
+| app/main.py       | Legacy browser entry point (kept for reference)                |
+
+## Models Used
+- Vision: gemini-2.5-flash via Vertex AI (service account auth)
+- Voice: gemini-2.5-flash-native-audio-preview-12-2025 via API key (Live API)
+
+## Controls
+- Space = mute/unmute mic
+- Enter = stop current action
+- Escape = quit
+- Text box = type goals manually
+
+================================================================================
+CHANGELOG
+================================================================================
+
+### Round 1 — Initial MVP
+- Built browser automation with Playwright + Gemini for web navigation
+- Created run.py, app/gemini.py, app/browser.py, app/main.py
+
+### Round 2 — SDK & Environment
+- Fixed global pip → created .venv
+- Migrated from deprecated vertexai SDK → google-genai with vertexai=True
+- Model: gemini-1.5-pro → gemini-2.0-flash → gemini-2.5-flash
+
+### Round 3 — Voice Module
+- Implemented Gemini Live API voice in voice_live.py
+- Switched PyAudio → sounddevice (PyAudio failed to build on Windows)
+- Removed echo prevention (user uses earphones)
+- SPACE = mute, ENTER = interrupt
+
+### Round 4 — OS-Level Architecture
+- Complete rebuild for full-screen control (not just browser)
+- Created app/screen.py (mss), app/vision.py (coordinate-based),
+  app/executor.py (pyautogui), app/safety.py, agent.py (orchestrator),
+  gui/overlay.py (tkinter GUI)
+
+### Round 5 — Key & Interaction Fixes
+- msvcrt → tkinter key bindings (msvcrt doesn't work when tkinter has focus)
+- Fixed self-interaction: vision prompt ignores "AI Voice Helper" window
+- Fixed robotic narration → natural, concise friend-like voice
+- Fixed speech routing: conversation vs action goals vs screen describe
+- Added open_app action with subprocess + 30 app aliases
+- Fixed typing: pyautogui.write() → clipboard paste (Ctrl+V) for reliability
+- Mouse save/restore around clicks
+
+### Round 6 — Duplicate App Fix
+- _open_app() now checks tasklist if process is already running
+- Uses Win32 EnumWindows + SetForegroundWindow to bring existing window to front
+- Vision prompt: "If the target app is already open, do NOT open it again"
+
+### Round 7 — Task Completion
+- Vision prompt: added "Task completion" section — check if goal is ALREADY done
+- After open_app succeeds: "the app IS visible, do NOT open it again"
+- After type succeeds: "check if text is visible, if so return done"
+- Fixed resp.text.strip() → (resp.text or "").strip() (null-safe)
+- Fixed response_modalities=["AUDIO"] → [types.Modality.AUDIO] (proper enum)
+- Fixed server.model_turn.parts null check
+- Fixed **pad dict spread in overlay → explicit padx=padx, pady=pady
+- POST_ACTION_DELAY 0.8s → 0.5s
+
+### Round 8 — Real-time Steering
+- JPEG screenshots (was PNG) — 3-5x smaller/faster
+- Goal steering: new goal mid-task → switches immediately without stopping
+- Reduced chatter: only narrates milestones (open_app, type), not every click
+- force_new flag on open_app for explicitly requesting new windows
+- Status feedback: "Looking → Thinking → Acting" in GUI
+- POST_ACTION_DELAY 0.5s → 0.3s, MAX_STEPS 20 → 15
+- Vision temperature 0.1 → 0.05
+
+### Round 9 — Vision Error Recovery
+- Vision errors no longer kill the task — retries with fresh screenshot
+- Added keyboard shortcut hints (Ctrl+S, Ctrl+Shift+S, etc.) to vision prompt
+- Added Save As dialog instructions: click address bar, type path, Enter
+
+### Round 10 — "What do you see?" Fix
+- Voice model was saying "I can't see" before screenshot arrived
+- Now sends [System] message immediately: "I'm taking a screenshot, wait"
+- Voice prompt updated: "When user asks what you see, do NOT say you can't see"
+
+### Round 11 — Universal App Support (REVERTED)
+- REVERTED: All Round 11 changes have been undone.
+- Removed: Expanded speech routing (back to ~40 action word whitelist)
+- Removed: Universal vision prompt (back to focused prompt)
+- Removed: Drag action
+- Removed: 20+ extra app aliases (VLC, OBS, GIMP, Blender, Steam, Zoom, etc.)
+- Removed: URI-scheme app launching (ms-photos:, ms-windows-store:, etc.)
+- Removed: Inline hotkey common shortcuts list in vision prompt
+- Removed: "For ANY unknown app" rule from vision prompt
+
+### Round 12 — Done-Verification (Screenshot-as-Truth)
+- ROOT CAUSE: Model declared tasks "done" based on action history, not the screenshot.
+  e.g. Save As dialog still open → model says "file saved" because it pressed Ctrl+S.
+- FIX 1 (vision prompt): New rule #1 — "THE SCREENSHOT IS GROUND TRUTH.
+  Ignore what previous actions claimed to do." Rule #2 — "NEVER return done
+  unless you can visually confirm in the screenshot that the goal is complete."
+- FIX 2 (context hints): Removed misleading "Last action succeeded" messages.
+  Now says "Action was sent. LOOK AT THE SCREENSHOT to verify what actually happened."
+  Removed "Text typed. Check if the goal is now done." hint that biased toward premature done.
+- FIX 3 (done-verification step): When model returns "done", agent takes a FRESH
+  screenshot and calls verify_done() — a separate vision call that checks if the goal
+  is truly complete. If NOT verified, feeds the reason back as an error and continues.
+
+### Round 13 — Loop Detection & Action History
+- ROOT CAUSE: Model kept repeating the same failed action (e.g. open_app Notepad 8x
+  in a row) because it only saw the LAST action, not the full history.
+  Also: model confused "app visible but not focused" with "app not open".
+- FIX 1 (action history): decide_action() now receives full action_history (last 5).
+  Model sees what's been tried: "1. open_app (notepad) 2. open_app (notepad) 3. ..."
+  Includes automatic "WARNING: tried 3+ times" message to force a different approach.
+- FIX 2 (hard loop breaker): Agent detects 4x same action type in a row and injects
+  a forced error: "LOOP DETECTED — use a completely different approach."
+  Suggests clicking the window or using Alt+Tab instead of open_app.
+- FIX 3 (vision prompt rules 9 & 14):
+  Rule 9: "NEVER repeat the same action more than twice. If open_app was tried and
+  the app is visible but not focused, use click or Alt+Tab instead."
+  Rule 14: "An app can be VISIBLE but NOT focused. If target app is visible anywhere
+  on screen, do NOT use open_app — click its window or use Alt+Tab."
+
+### Round 14 — Question Routing Fix
+- ROOT CAUSE: "what document or app is open on my screen" was routed as a GOAL
+  (matched "open" in _ACTION_PATTERN) instead of as a screen query. The vision model
+  then hallucinated a "done" answer without looking at the screenshot properly.
+- FIX 1 (screen query expansion): Added "do you see", "what document/file/folder",
+  "which document/file", and catch-all patterns like "what.*open.*screen" and
+  "what.*screen.*show" to _SCREEN_QUERY_PATTERN.
+- FIX 2 (question filter): New _QUESTION_PATTERN detects questions starting with
+  what/which/where/who/how/do you/can you see. If text is a question AND doesn't
+  contain strong action verbs (open/save/delete/etc.), _is_computer_task returns False.
+  This prevents questions like "what is open" from being routed as tasks.
+  Real commands like "can you open notepad" still route correctly (has strong verb "open" 
+  as an imperative, not a question about state).
+
+### Round 15 — Transparent Status + Premium GUI
+- Transparent narrations: Voice now tells user what it's doing at each step.
+  "Taking a screenshot to see what's on screen" (step 1), "Let me verify that's
+  actually done" (verification). Status bar shows emoji-labeled phases:
+  📸 Capturing, 🧠 Analyzing, ⚡ Executing, ✅ Verifying.
+- Premium GUI redesign (Tesla/Grok inspired):
+  - Deep black (#0a0a0f) background with glowing electric cyan (#00d4ff) accents
+  - Pulsing mic dot that breathes between green shades when listening
+  - Glowing cyan header underline that alternates blue/cyan
+  - Card-based layout: Status, Goal, Activity Log in bordered panels
+  - Neon color coding: cyan (user), green (gemini), purple (screenshot),
+    blue (analyzing), amber (thinking), red (errors)
+  - Cyan-bordered input field with ▶ GO button
+  - Red glow STOP button, elevated MUTE/DESCRIBE/QUIT buttons
+  - Monospace bottom hotkey bar
+  - Scrollable log with proper selection highlighting
+
+### Round 16 — Hindi Transcription Fix + Action History Bug
+- ROOT CAUSE 1: Voice model transcribed English speech as Hindi (ओपन ए न्यू नोटपैड).
+  Gemini Live API auto-detects language from audio and sometimes picks wrong language.
+- FIX 1 (voice prompt): Added explicit English language directive at the TOP of the
+  system instruction: "The user speaks ENGLISH. You MUST always listen, transcribe,
+  and respond in ENGLISH only. Even if the audio sounds like another language, interpret
+  it as English. NEVER transcribe in Hindi, Spanish, or any other language."
+- ROOT CAUSE 2 (CRITICAL BUG): In vision.py decide_action(), the `context_parts` list
+  was being RESET to empty after building the action history (duplicate line at ~L149:
+  `context_parts = [f"GOAL: {goal}"]`). This wiped ALL action history, loop warnings,
+  and step info. The model NEVER saw what it tried before, causing infinite open_app loops.
+- FIX 2: Removed the duplicate context_parts reset. Action history + loop warnings
+  now correctly flow to the vision model.
+- FIX 3 (vision prompt rules 15-16): Added taskbar awareness — "CHECK THE TASKBAR:
+  If an app's icon is visible in the taskbar, the app IS running. Click the taskbar
+  icon to bring it to focus." Added rule 16: "When asked to type/write content in an
+  app, FIRST make sure the app window is focused and the text area is clicked."
+
+### Round 17 — Overlay Occlusion Fix + Voice "Done" Spam
+- ROOT CAUSE 1: The AI Voice Helper overlay (780×900, always-on-top) was IN every
+  screenshot, covering whatever app was behind it. The vision model literally could
+  not see Notepad because the overlay was on top of it → kept calling open_app.
+- FIX 1 (screen.py): capture_screen() now hides the overlay before capture and
+  restores it after. Uses ctypes FindWindowW("AI Voice Helper") → ShowWindow(SW_HIDE),
+  captures, then ShowWindow(SW_SHOW) + SetWindowPos(HWND_TOPMOST). Instant, no
+  flicker. The model now sees the FULL desktop without the overlay blocking anything.
+- ROOT CAUSE 2: Vision rule 6 said "NEVER click taskbar icons" but rule 15 said
+  "Click the taskbar icon to bring it to focus" — direct contradiction. Model
+  couldn't use the taskbar as a fallback to find running apps.
+- FIX 2: Rewrote rule 6 — "Use open_app ONLY to launch apps that are NOT already
+  running. If the app is already running (visible in taskbar or on screen), use
+  click or Alt+Tab instead."
+- ROOT CAUSE 3: Voice model said "Done" on its own before the action loop finished.
+  User heard "Done" but nothing had actually happened. The voice-side Gemini has no
+  knowledge of whether the task is actually complete.
+- FIX 3 (voice prompt): Added explicit instruction: "NEVER say 'Done' or 'Finished'
+  on your own. Only say task completion words AFTER you receive a [System] message
+  confirming it. When the user gives a command, say 'On it' and WAIT."
+
+### Round 18 — Flicker-Free Screenshots + Language Lock + Writing Goals
+- ROOT CAUSE 1: ShowWindow(SW_HIDE/SW_SHOW) caused visible GUI flicker — the overlay
+  kept minimizing and restoring every time a screenshot was taken (~every 0.5-1s).
+  Users saw constant blinking which was "very difficult and annoying."
+- FIX 1 (screen.py): Replaced SW_HIDE/SW_SHOW with SetLayeredWindowAttributes.
+  Now sets window opacity to 0 (fully transparent) during capture, then back to 255.
+  The window stays in place, never minimizes — zero flicker, zero visual disruption.
+- ROOT CAUSE 2: Hindi transcription STILL happening despite system_instruction.
+  The Live API auto-detects spoken language from audio, and the system_instruction
+  alone wasn't enough to override it.
+- FIX 2 (agent.py): Added language_code="en-US" to SpeechConfig. This is the proper
+  API-level language lock that forces transcription to English, not a soft prompt hint.
+- ROOT CAUSE 3: Voice model STILL said "Done" / "I've typed..." / "It's done" before
+  tasks actually completed. Previous "IMPORTANT: NEVER say Done" was too weak.
+- FIX 3 (voice prompt): Massively strengthened the no-completion-language rule with
+  exhaustive list ("Done", "Finished", "All done", "It's done", "I've typed...",
+  "I've written..."). Added "You do NOT know if the task succeeded." and
+  "Do NOT narrate what you THINK is happening. WAIT for [System] to tell you."
+- ROOT CAUSE 4: Vision model declared "done" when old text ("Hello, world!") was
+  visible, ignoring that the goal was "write a startup guide." Old text ≠ goal complete.
+- FIX 4 (vision rules 17-18): Rule 17 — "For write/type goals, done ONLY when the
+  NEW requested content is visible. Old/unrelated text does NOT count."
+  Rule 18 — "When user says 'clear that' or 'replace', use Ctrl+A first to select
+  all text, then type new content (typing replaces the selection)."
+
+### Round 19 — UI Automation + Click Accuracy + Speed
+- MAJOR: Added Windows UI Automation (app/ui_elements.py) — uses the same
+  Windows Accessibility API that screen readers like JAWS use.
+  Extracts interactive elements (buttons, links, text fields, menus) with their
+  EXACT pixel-perfect bounding box coordinates from the focused window.
+  Vision model now receives a numbered element list alongside the screenshot:
+    [ 3] button  "Not interested" at (860, 615)
+    [ 4] button  "Try it" at (940, 615)
+  Model uses these exact coordinates instead of guessing pixels from the image.
+  Runs in ~0.15s per scan. Max 40 elements, max depth 10 in UI tree.
+- FIX 1 (coordinates): Removed mouse save/restore after clicks. The old code
+  moved the mouse back to its original position after every click, which:
+  a) Made the next screenshot show the cursor far from where it clicked
+  b) Made the model think the click didn't work (cursor in wrong spot)
+  c) Caused "mouse going back and forth in 2 same positions" behavior
+  Now the cursor stays where it clicked — matching user expectation.
+- FIX 2 (resolution): Screenshot MAX_WIDTH 1280→1920 (native res, no downscale).
+  JPEG quality 75→80. Small buttons are now full-size, much easier to target.
+- FIX 3 (screen descriptions for blind users): Completely rewrote describe_screen()
+  prompt. Old version gave vague summaries ("Google search homepage"). New version:
+  1) Reads out visible text and dialog messages VERBATIM
+  2) Lists all buttons/choices so user can decide ("Save, Don't Save, Cancel")
+  3) Describes the foreground app and what it shows
+  4) Mentions background windows and taskbar apps
+  Designed to fully replace a screen reader for the blind user.
+- FIX 4 (URL navigation): Added vision rule 14 — for opening websites, use Ctrl+L
+  to focus the address bar and type the URL directly. No more clicking around
+  trying to find the search bar.
+- FIX 5 (Hindi filter): Code-level filter in agent.py — _is_non_english() detects
+  Devanagari/non-Latin characters (>30% threshold) and drops those transcription
+  chunks entirely. Belt-and-suspenders with language_code="en-US".
+- FIX 6 (vision rule 19): "If a click didn't work, your coordinates were WRONG.
+  Look more carefully and try different coordinates." Prevents repeating same
+  bad coordinates.
+- Updated requirements.txt: added uiautomation>=2.0.18, pyperclip>=1.8.0.
+- Updated file structure: added app/ui_elements.py.
+
+### Round 20 — Transcription Quality, Speed & Robustness
+- FIX 1 (word spacing): Transcription chunks were concatenated without spaces,
+  producing mashed text like "Canyouseemyscreenwhatappormywhat". Added space
+  separator between chunks in both user_text and gemini_text buffers.
+- FIX 2 (speed): Reduced screenshot MAX_WIDTH 1920→1536 and JPEG quality 80→75.
+  Smaller images = faster uploads + faster vision inference. Still clear enough
+  for accurate click targeting.
+- FIX 3 ("fast" misheard as "stop"): Updated voice system prompt to explicitly
+  warn: "do NOT treat similar-sounding words as stop — 'fast', 'last', 'past',
+  'class', etc. ONLY exact 'stop' or 'cancel'."
+- FIX 4 (describe debounce): When multiple "what do you see?" requests queue up
+  rapidly, the action thread now drains duplicate describe requests and only
+  processes the last one. Prevents redundant Screen: entries in the activity log.
+- FIX 5 (describe + UI elements): describe_screen() now accepts ui_elements_text
+  parameter. When available, accessibility-detected UI elements are included in
+  the describe prompt, giving blind users precise info about buttons, menus,
+  and interactive elements beyond what's visible in the screenshot.
+
+### Round 21 — Speed Restoration
+- ROOT CAUSE: System was ~5s slower per action step compared to Round 9 due to
+  accumulated overhead from Rounds 12-20 (verify_done, UI automation, longer
+  delays, larger prompts, excessive narration).
+- FIX 1 (POST_ACTION_DELAY): 0.5s → 0.3s (matching Round 8 speed).
+- FIX 2 (MAX_STEPS): 25 → 15. Forces the model to be efficient. Fewer wasted
+  steps on long chains of failed actions.
+- FIX 3 (verify_done skip for quick goals): verify_done (extra screenshot + API
+  call, ~2.5s) now only runs for complex goals that took 4+ steps. Simple goals
+  (1-3 steps) trust the main vision model's "done" judgment. This was the single
+  biggest speed regression from Round 12.
+- FIX 4 (overlay sleep): 0.05s → 0.02s per screenshot capture. At 60fps, one
+  frame is 16ms — 0.02s is more than enough for the compositor.
+- FIX 5 (resize algorithm): PIL LANCZOS → BILINEAR. ~3x faster resize with
+  negligible quality loss for the vision model. Screenshot encode is now faster.
+- FIX 6 (remove narration delay): Removed "Taking a screenshot to see what's
+  on screen" narration on step 1 and "Let me verify that's actually done" on
+  completion. These pushed audio to the voice model, which spoke them out before
+  the actual work started — adding perceived delay. "On it" is sufficient.
+- FIX 7 (word spacing revert): REVERTED Round 20 Fix 1. The added space between
+  transcription chunks was splitting words: "O pen Mi cro soft Edge". The Live
+  API sends sub-word chunks — raw concatenation is correct. The original "mashed
+  words" issue was likely caused by Hindi chunks mixing in (now filtered by
+  _is_non_english).
