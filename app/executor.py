@@ -17,6 +17,37 @@ import pyperclip
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.1  # 100ms pause between pyautogui calls (was 50ms — too fast)
 
+# ── Overlay z-order management ──────────────────────────────────────────────
+_OVERLAY_TITLE = "AI Voice Helper"
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_HWND_NOTOPMOST = -2
+_HWND_TOPMOST = -1
+
+
+def _lower_overlay():
+    """Remove topmost from the overlay so launched apps can appear above it."""
+    try:
+        hwnd = ctypes.windll.user32.FindWindowW(None, _OVERLAY_TITLE)
+        if hwnd:
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, _HWND_NOTOPMOST, 0, 0, 0, 0, _SWP_NOMOVE | _SWP_NOSIZE
+            )
+    except Exception:
+        pass
+
+
+def _raise_overlay():
+    """Restore topmost on the overlay."""
+    try:
+        hwnd = ctypes.windll.user32.FindWindowW(None, _OVERLAY_TITLE)
+        if hwnd:
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, _HWND_TOPMOST, 0, 0, 0, 0, _SWP_NOMOVE | _SWP_NOSIZE
+            )
+    except Exception:
+        pass
+
 
 def execute_action(
     action: dict,
@@ -36,6 +67,11 @@ def execute_action(
     """
     act = action.get("action", "").lower()
     explanation = action.get("explanation", "")
+
+    # Lower the overlay for all interactive actions so clicks/launches
+    # hit the actual app, not the always-on-top overlay
+    if act not in ("wait", "done"):
+        _lower_overlay()
 
     try:
         if act == "open_app":
@@ -227,6 +263,63 @@ def _activate_window_by_pids(pids: set[int]) -> bool:
     return False
 
 
+def _activate_window_by_title(title_substring: str) -> bool:
+    """Find and activate a visible window whose title contains the given substring."""
+    try:
+        user32 = ctypes.windll.user32
+        found = [0]
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _cb(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buf, 256)
+            title = buf.value
+            if title_substring.lower() in title.lower() and len(title) > 0:
+                # Skip the AI Voice Helper window
+                if "AI Voice Helper" in title:
+                    return True
+                found[0] = hwnd
+                return False
+            return True
+
+        user32.EnumWindows(_cb, 0)
+
+        if found[0]:
+            user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
+            user32.keybd_event(0x12, 0, 2, 0)  # VK_MENU up
+            user32.ShowWindow(found[0], 9)  # SW_RESTORE
+            user32.SetForegroundWindow(found[0])
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# Title substrings for finding app windows after launch
+_APP_WINDOW_TITLES: dict[str, str] = {
+    "msedge": "Edge",
+    "chrome": "Chrome",
+    "firefox": "Firefox",
+    "brave": "Brave",
+    "opera": "Opera",
+    "notepad.exe": "Notepad",
+    "calc.exe": "Calculator",
+    "mspaint.exe": "Paint",
+    "explorer.exe": "File Explorer",
+    "code": "Visual Studio Code",
+    "excel": "Excel",
+    "winword": "Word",
+    "powerpnt": "PowerPoint",
+    "outlook": "Outlook",
+    "spotify": "Spotify",
+    "discord": "Discord",
+    "slack": "Slack",
+    "msteams": "Teams",
+}
+
+
 def _open_app(app_name: str, explanation: str, force_new: bool = False) -> tuple[bool, str]:
     """Open an application by name, or activate it if already running."""
     name_lower = app_name.lower().strip()
@@ -238,32 +331,40 @@ def _open_app(app_name: str, explanation: str, force_new: bool = False) -> tuple
         # Resolve the exe name to check in tasklist
         check_name = exe if exe.endswith(".exe") else exe + ".exe"
 
-        # If already running and we don't need a new window, bring to foreground
+        # If already running and we don't need a new window, try to bring to foreground
         if not force_new:
             pids = _get_process_pids(check_name)
             if pids:
+                _lower_overlay()  # let the app appear above the overlay
                 activated = _activate_window_by_pids(pids)
                 if activated:
                     time.sleep(0.5)
                     return True, f"{app_name} is already open — brought to foreground"
-                # PIDs exist but no visible window (background processes)
-                # Fall through to launch a new window
+                # PIDs exist but no visible window — fall through to launch
 
-        # Not running — launch it
+        # Not running (or no visible window) — launch it
         try:
+            _lower_overlay()  # let the new window appear above the overlay
             subprocess.Popen(
                 exe,
                 shell=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            time.sleep(1.5)
-            return True, f"Opened {app_name} — {explanation}"
+            # Wait for the window to appear, then force-activate it
+            title_hint = _APP_WINDOW_TITLES.get(exe, app_name)
+            for _attempt in range(8):  # up to 4 seconds
+                time.sleep(0.5)
+                if _activate_window_by_title(title_hint):
+                    return True, f"Opened {app_name} — {explanation}"
+            # Window didn't appear but process launched
+            return True, f"Launched {app_name} (window may take a moment)"
         except Exception:
             pass  # fall through to search
 
     # 2) Fallback: use Windows Search (Win+S → type name → Enter)
     try:
+        _lower_overlay()  # let the search UI and app appear above the overlay
         pyautogui.hotkey("win", "s")
         time.sleep(0.8)  # wait for search to open
 

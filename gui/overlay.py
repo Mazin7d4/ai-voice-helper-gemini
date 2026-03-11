@@ -50,6 +50,8 @@ class VoiceHelperApp:
         self.root.configure(bg=BG_DEEP)
         self.root.resizable(True, True)
         self.root.attributes("-topmost", True)
+        # Prevent overlay from stealing focus from launched apps
+        self.root.attributes("-toolwindow", True)
         self.root.minsize(600, 700)
 
         # Remove default window decorations styling
@@ -409,7 +411,7 @@ class VoiceHelperApp:
 
                 elif status_type == "restore":
                     self.root.deiconify()
-                    self.root.lift()
+                    # Don't call root.lift() — it steals focus from launched apps
 
                 elif status_type == "quit":
                     self.root.after(100, self.root.destroy)

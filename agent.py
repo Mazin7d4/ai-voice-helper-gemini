@@ -685,15 +685,12 @@ def _handle_goal(goal: str):
         # 2) Ask Gemini for next action
         post_status("status", f"🧠 Step {step}...")
 
-        # Gather UI elements for clicking accuracy — skip step 1 (usually open_app)
-        # and skip after non-interactive actions (open_app, hotkey, done, wait)
+        # Always gather UI elements for accurate clicking
         ui_text = None
-        last_act_type = (last_action or {}).get("action", "")
-        if step > 1 and last_act_type not in ("open_app", "hotkey", "done", "wait", ""):
-            try:
-                _, ui_text = get_ui_elements(screen_size=ss_size)
-            except Exception:
-                pass  # non-critical — vision model works without it
+        try:
+            _, ui_text = get_ui_elements(screen_size=ss_size)
+        except Exception:
+            pass  # non-critical \u2014 vision model works without it
 
         try:
             action = decide_action(

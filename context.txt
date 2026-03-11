@@ -1,0 +1,20 @@
+Progress Update — March 10, 2026
+===================================
+
+Our work is going well — we have good progress.
+
+The main remaining issue is click accuracy. The system got stuck because it
+couldn't click on folders correctly in some cases.
+
+Example: When asked to save a Notepad document to the Desktop, the vision
+model navigated to the C: drive instead, because "Desktop" wasn't visible
+in the Quick Access sidebar at that moment. We got stuck due to click
+inaccuracy on the folder tree.
+
+However, most clicks and core functions are much better than before:
+- When asked to save to the Downloads folder, it DID correctly click on
+  Downloads from the Quick Access sidebar.
+- It then couldn't accurately click the Save button — minor improvement needed.
+
+Overall the system is functional and improving. Click precision and task
+logic need minor refinement, which we can address later.
