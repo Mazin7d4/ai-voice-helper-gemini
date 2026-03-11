@@ -435,17 +435,22 @@ def is_browser_goal(goal: str, app_name_extractor=None) -> bool:
         if not re.search(r"\b(notepad|excel|word|explorer|file|folder|settings)\b", lower):
             return True
 
-    # If Playwright browser is already active, interactive goals go to it
+    # If Playwright browser is already active, DEFAULT to browser for all goals
+    # UNLESS the goal is clearly about an OS-level app
     browser = get_browser()
     if browser.is_active:
-        # But not if it's about opening an OS-level app
+        # Opening a known OS app → use OS executor
         if app_name_extractor and app_name_extractor(goal):
             return False
-        # Interactive verbs → browser
+        # Explicitly about OS-level actions → skip browser
         if re.search(
-            r"\b(click|type|scroll|go to|navigate|enter|submit|fill|select|choose|ask)\b",
+            r"\b(notepad|excel|word|powerpoint|explorer|file manager|settings|terminal|"
+            r"cmd|powershell|task manager|control panel|calculator|paint|snipping)",
             lower,
         ):
-            return True
+            return False
+        # Everything else goes to browser when it's active
+        # (close popup, press button, search, type, scroll, read, etc.)
+        return True
 
     return False

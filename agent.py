@@ -181,6 +181,9 @@ async def voice_session():
                     "THE USER IS BLIND. NEVER ask them to describe what they see, check the screen, "
                     "or look at anything. YOU are their eyes. If you need to know what's on screen, "
                     "call the describe_screen tool yourself — never ask the user to look. "
+                    "When the user asks to use a browser or open a website, a Chromium browser will open. "
+                    "If they say 'open Firefox' or 'open Chrome', say 'Opening the browser for you' — "
+                    "do NOT say 'Opening Firefox' or 'Opening Chrome' since it's actually Chromium. "
                     "\n\nCRITICAL: Use the execute_task tool for ANY computer command the user gives. "
                     "If user says just an app name like 'notepad' or 'chrome', call execute_task with 'open notepad' or 'open chrome'. "
                     "Use describe_screen when user asks what's on screen, OR when you need to check screen state yourself. "
@@ -580,9 +583,27 @@ def _handle_describe():
     """Take a screenshot and describe what's on screen."""
     post_status("status", "📸 Looking...")
     try:
-        png_bytes, ss_size = capture_screen(monitor_index=1)
+        # If Playwright browser is active, include browser context
+        browser = get_browser()
+        if browser.is_active:
+            png_bytes = browser.screenshot()
+            interactive_els = browser.get_interactive_elements()
+            page_info = browser.get_page_info()
+            ui_text = ""
+            if page_info.get("title"):
+                ui_text += f"Page: {page_info['title']} ({page_info.get('url', '')})"
+            if interactive_els:
+                ui_text += f"\nInteractive elements:\n{interactive_els}"
+        else:
+            png_bytes, ss_size = capture_screen(monitor_index=1)
+            ui_text = None
+            try:
+                _, ui_text = get_ui_elements(screen_size=ss_size)
+            except Exception:
+                pass
+
         post_status("status", "🔍 Analyzing screen...")
-        description = describe_screen(png_bytes)
+        description = describe_screen(png_bytes, ui_elements_text=ui_text)
         narration_queue.put(f"[Screen description] {description}")
         post_status("action_log", f"Screen: {description}")
     except Exception as e:
