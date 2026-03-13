@@ -39,10 +39,14 @@ from app.ui_elements import get_ui_elements
 from app.browser import get_browser, resolve_url, extract_search_query, is_browser_goal
 
 
+
+# ── Popup suppression global flag ──
+suppress_popups = threading.Event()  # set = suppress all popup questions
+
 def _handle_popup_for_user(browser, goal: str) -> bool:
     """
     Check if there's a popup/dialog/CAPTCHA on the page.
-    If found, narrate it to the user and wait for their decision.
+    If found, narrate it to the user and wait for their decision, unless popups are suppressed.
 
     Returns True if a popup was handled (caller should skip vision model),
     False if no popup detected (caller should proceed normally).
@@ -51,9 +55,14 @@ def _handle_popup_for_user(browser, goal: str) -> bool:
     if not popup:
         return False
 
+    # If suppression is on, auto-ignore popups (unless it's a CAPTCHA)
+    popup_type = popup.get("type", "")
+    if suppress_popups.is_set() and "captcha" not in popup_type.lower():
+        post_status("action_log", "Popup auto-ignored due to suppression mode.")
+        return True
+
     desc = popup.get("description", "Something appeared on screen.")
     options = popup.get("options", [])
-    popup_type = popup.get("type", "")
 
     # Build a clear narration for the blind user
     if "captcha" in popup_type.lower():
@@ -64,7 +73,6 @@ def _handle_popup_for_user(browser, goal: str) -> bool:
         )
     elif options:
         opts_text = ", ".join(f"'{o}'" for o in options[:6])
-        # Summarize what the popup says
         short_desc = desc[:150].replace("\n", " ").strip()
         if short_desc:
             narration_queue.put(
@@ -94,11 +102,23 @@ def _handle_popup_for_user(browser, goal: str) -> bool:
             new_cmd = goal_queue.get(timeout=0.1)
             if new_cmd[0] == "goal":
                 user_choice = new_cmd[1]
+                # Check for popup suppression commands
+                lower_choice = user_choice.lower().strip()
+                if any(phrase in lower_choice for phrase in ["ignore popups", "suppress popups", "don't ask about popups", "dont ask about popups", "disable popups", "no popups"]):
+                    suppress_popups.set()
+                    narration_queue.put("[System] Okay, I won't ask about popups anymore unless it's critical.")
+                    post_status("action_log", "User enabled popup suppression mode.")
+                    return True
+                if any(phrase in lower_choice for phrase in ["allow popups", "enable popups", "ask about popups", "show popups"]):
+                    suppress_popups.clear()
+                    narration_queue.put("[System] Popup questions are enabled again.")
+                    post_status("action_log", "User disabled popup suppression mode.")
+                    return True
+
                 post_status("action_log", f"↪ User chose: {user_choice}")
                 narration_queue.put("[System] Got it.")
 
                 # Try to match user's choice to a popup button
-                lower_choice = user_choice.lower().strip()
                 for opt in options:
                     if opt.lower() in lower_choice or lower_choice in opt.lower():
                         try:
@@ -111,7 +131,6 @@ def _handle_popup_for_user(browser, goal: str) -> bool:
 
                 # If no exact match, treat user's text as a click target
                 if any(word in lower_choice for word in ["click", "press", "select", "choose", "yes", "ok"]):
-                    # Extract what to click from user's response
                     for opt in options:
                         try:
                             msg = browser.click_element(opt)
@@ -607,11 +626,24 @@ def _parse_gemini_commands(gemini_output: str):
 
 def _process_user_speech(text: str):
     """Analyze user speech and route to the right handler."""
+
     lower = text.lower().strip()
     if not lower:
         return
 
     print(f"[ROUTE] text='{text}' is_task={_is_computer_task(lower)} fast_app={_extract_open_app(text)}")
+
+    # Popup suppression voice/text commands
+    if any(phrase in lower for phrase in ["ignore popups", "suppress popups", "don't ask about popups", "dont ask about popups", "disable popups", "no popups"]):
+        suppress_popups.set()
+        narration_queue.put("[System] Okay, I won't ask about popups anymore unless it's critical.")
+        post_status("action_log", "User enabled popup suppression mode (via voice/text).")
+        return
+    if any(phrase in lower for phrase in ["allow popups", "enable popups", "ask about popups", "show popups"]):
+        suppress_popups.clear()
+        narration_queue.put("[System] Popup questions are enabled again.")
+        post_status("action_log", "User disabled popup suppression mode (via voice/text).")
+        return
 
     # 1) Confirmation (highest priority — time-sensitive when waiting)
     if _CONFIRM_PATTERN.search(lower):
